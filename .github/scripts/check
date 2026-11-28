@@ -91,7 +91,11 @@ check_one() {
   fi
 
   # Reject animated PNGs (APNG): ImageMagick's PNG coder reads only frame 1.
-  if [[ $ext == "png" ]] && command -v python3 >/dev/null 2>&1; then
+  if [[ $ext == "png" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "$f: python3 is required to verify PNG files are not animated (APNG)" >&2
+      return 1
+    fi
     if ! python3 -c '
 import struct, sys
 with open(sys.argv[1], "rb") as fp:
