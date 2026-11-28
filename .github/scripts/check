@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Validate every shipped theme background still.
+# Matches the exact */* glob used by omarchy-pkgs/pkgbuilds/omarchy-themes-backgrounds/PKGBUILD
+# so anything that would ship in the package is checked here.
+# Usage: .github/scripts/check [path ...]
+
+set -euo pipefail
+
+MAX_EDGE=5120
+
+cd "$(dirname "$0")/../.."
+
+if command -v magick >/dev/null 2>&1; then
+  MAGICK=(magick)
+  IDENTIFY=(magick identify)
+elif command -v convert >/dev/null 2>&1 && command -v identify >/dev/null 2>&1; then
+  MAGICK=(convert)
+  IDENTIFY=(identify)
+else
+  echo "ImageMagick (magick or convert/identify) is required" >&2
+  exit 1
+fi
+
+command -v dwebp >/dev/null 2>&1 || { echo "dwebp is required (install webp on Ubuntu/macOS or libwebp-utils on Arch)" >&2; exit 1; }
+
+if (($# > 0)); then
+  files=("$@")
+else
+  shopt -s nullglob
+  files=(*/*)
+fi
+
+(( ${#files[@]} > 0 )) || { echo "no background files found" >&2; exit 1; }
+
+check_one() {
+  local f=$1
+  if [[ -L $f || ! -f $f ]]; then
+    echo "$f: must be a regular file" >&2
+    return 1
+  fi
+
+  local base=${f##*/}
+  if [[ $base != *.* ]]; then
+    echo "$f: missing file extension (allowed: webp, jpg, jpeg, png)" >&2
+    return 1
+  fi
+
+  local ext expected_fmt
+  ext=$(printf "%s" "${base##*.}" | tr "[:upper:]" "[:lower:]")
+  case $ext in
+    webp) expected_fmt="WEBP" ;;
+    jpg|jpeg) expected_fmt="JPEG" ;;
+    png) expected_fmt="PNG" ;;
+    *)
+      echo "$f: unsupported extension '.$ext' (allowed: webp, jpg, jpeg, png)" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -s $f ]]; then
+    echo "$f: file is empty" >&2
+    return 1
+  fi
+
+  local info frames fmt w h
+  if ! info=$("${IDENTIFY[@]}" -ping -format "%m %w %h\n" -- "$f" 2>/dev/null); then
+    echo "$f: unreadable image header" >&2
+    return 1
+  fi
+
+  frames=$(printf "%s\n" "$info" | awk 'NF { c++ } END { print c+0 }')
+  if (( frames != 1 )); then
+    echo "$f: expected a single still frame (found $frames)" >&2
+    return 1
+  fi
+
+  read -r fmt w h <<<"$info"
+  if [[ $fmt != "$expected_fmt" ]]; then
+    echo "$f: image format is $fmt, expected $expected_fmt for .$ext" >&2
+    return 1
+  fi
+
+  if [[ ! ${w:-} =~ ^[0-9]+$ || ! ${h:-} =~ ^[0-9]+$ || $w -le 0 || $h -le 0 ]]; then
+    echo "$f: invalid dimensions '$info'" >&2
+    return 1
+  fi
+
+  if (( w > MAX_EDGE || h > MAX_EDGE )); then
+    echo "$f: ${w}x${h} exceeds ${MAX_EDGE}px max edge (run .github/scripts/prepare)" >&2
+    return 1
+  fi
+
+  # Reject animated PNGs (APNG): ImageMagick's PNG coder reads only frame 1.
+  if [[ $ext == "png" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "$f: python3 is required to verify PNG files are not animated (APNG)" >&2
+      return 1
+    fi
+    if ! python3 -c '
+import struct, sys
+with open(sys.argv[1], "rb") as fp:
+    if fp.read(8) != b"\x89PNG\r\n\x1a\n":
+        sys.exit(1)
+    while True:
+        hdr = fp.read(8)
+        if len(hdr) < 8:
+            break
+        length, ctype = struct.unpack(">I4s", hdr)
+        if ctype == b"acTL":
+            sys.exit(2)
+        if ctype == b"IDAT":
+            break
+        fp.seek(length + 4, 1)
+' "$f"; then
+      echo "$f: animated PNG (APNG) is not allowed" >&2
+      return 1
+    fi
+  fi
+
+  # Verify the image decodes cleanly (header ping alone misses truncated payloads;
+  # -regard-warnings turns truncated JPEG warnings into a non-zero exit).
+  if [[ $ext == "webp" ]]; then
+    if ! dwebp -quiet -o /dev/null -- "$f" 2>/dev/null; then
+      echo "$f: WebP payload failed to decode" >&2
+      return 1
+    fi
+  else
+    if ! "${MAGICK[@]}" -regard-warnings "$f" null: >/dev/null 2>&1; then
+      echo "$f: image payload failed to decode" >&2
+      return 1
+    fi
+  fi
+}
+
+jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+failed=0
+pids=()
+for f in "${files[@]}"; do
+  check_one "$f" &
+  pids+=("$!")
+  if (( ${#pids[@]} >= jobs )); then
+    wait "${pids[0]}" || failed=1
+    pids=(${pids[@]:1})
+  fi
+done
+if (( ${#pids[@]} > 0 )); then
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+fi
+
+if (( failed == 0 )); then
+  echo "${#files[@]} backgrounds pass (all <= ${MAX_EDGE}px)"
+fi
+exit "$failed"
