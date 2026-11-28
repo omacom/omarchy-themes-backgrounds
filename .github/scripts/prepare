@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Prepare one or more background stills for omarchy-themes-backgrounds.
+# Caps images to 5120px on the long edge (5K) using linear-light Lanczos3
+# downscaling for photographs and palette-preserving lossless WebP for
+# lossless low-color (<=256 colors) illustrations. Preserves alpha channels
+# and RGB ICC profiles (such as Display P3 or sRGB).
+#
+# Usage: .github/scripts/prepare <image> [image ...]
+
+set -euo pipefail
+
+MAX_EDGE=5120
+MIN_PSNR=42.0
+
+(($# > 0)) || { echo "usage: .github/scripts/prepare <image> [image ...]" >&2; exit 1; }
+
+if command -v magick >/dev/null 2>&1; then
+  MAGICK=(magick)
+  IDENTIFY=(magick identify)
+  COMPARE=(magick compare)
+elif command -v convert >/dev/null 2>&1 && command -v identify >/dev/null 2>&1 && command -v compare >/dev/null 2>&1; then
+  MAGICK=(convert)
+  IDENTIFY=(identify)
+  COMPARE=(compare)
+else
+  echo "ImageMagick (magick or convert/identify/compare) is required" >&2
+  exit 1
+fi
+
+for tool in cwebp webpinfo webpmux; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "$tool is required (install webp on Ubuntu/macOS or libwebp-utils on Arch)" >&2; exit 1; }
+done
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+psnr_of() {
+  local ref=$1 cand=$2 raw
+  raw=$("${COMPARE[@]}" -metric PSNR -- "$ref" "$cand" null: 2>&1 || true)
+  awk '{print $1}' <<<"$raw"
+}
+
+file_size() {
+  wc -c <"$1" | tr -d "[:space:]"
+}
+
+is_lossless_source() {
+  local path=$1 ext=$2
+  case $ext in
+    png) return 0 ;;
+    webp) webpinfo -summary "$path" 2>/dev/null | grep -q "Format: Lossless" ;;
+    *) return 1 ;;
+  esac
+}
+
+is_rgb_icc() {
+  local icc=$1 space
+  [[ -s $icc ]] || return 1
+  # ICC header bytes 16..19 hold the 4-byte data color space signature ("RGB ").
+  space=$(dd if="$icc" bs=1 skip=16 count=4 2>/dev/null || true)
+  [[ $space == "RGB " ]]
+}
+
+for src in "$@"; do
+  [[ -f $src && ! -L $src ]] || { echo "$src: not a regular file" >&2; exit 1; }
+
+  dims=$("${IDENTIFY[@]}" -ping -format "%w %h\n" -- "$src" 2>/dev/null || true)
+  frames=$(printf "%s\n" "$dims" | awk 'NF { c++ } END { print c+0 }')
+  if (( frames != 1 )); then
+    echo "$src: expected a single still frame (found $frames)" >&2
+    exit 1
+  fi
+
+  read -r w h <<<"$dims"
+  if (( w <= MAX_EDGE && h <= MAX_EDGE )); then
+    echo "skip $src (${w}x${h} already <= ${MAX_EDGE}px)"
+    continue
+  fi
+
+  base=${src##*/}
+  ext=$(printf "%s" "${base##*.}" | tr "[:upper:]" "[:lower:]")
+  if [[ $ext != "webp" ]]; then
+    dst="${src%.*}.webp"
+    if [[ -e $dst ]]; then
+      echo "$dst already exists; refusing to overwrite from $src" >&2
+      exit 1
+    fi
+  else
+    dst="$src"
+  fi
+
+  orig_sz=$(file_size "$src")
+  colors=$("${IDENTIFY[@]}" -format "%k" -- "$src")
+  alpha=$("${IDENTIFY[@]}" -format "%A" -- "$src")
+  has_alpha=0
+  case $alpha in
+    Undefined|False|false|Off|off|None|none|"") has_alpha=0 ;;
+    *) has_alpha=1 ;;
+  esac
+
+  ref_png="$tmp/ref.png"
+  out_webp="$tmp/out.webp"
+  out_icc_webp="$tmp/out-icc.webp"
+  icc_file="$tmp/profile.icc"
+  rm -f "$ref_png" "$out_webp" "$out_icc_webp" "$icc_file"
+
+  has_rgb_icc=0
+  if "${MAGICK[@]}" "$src" "icc:$icc_file" 2>/dev/null && is_rgb_icc "$icc_file"; then
+    has_rgb_icc=1
+  fi
+
+  if is_lossless_source "$src" "$ext" && (( colors <= 256 )); then
+    # Preserve the exact palette of lossless indexed/flat art without Lanczos blur.
+    png_fmt="PNG8"
+    (( has_alpha == 1 )) && png_fmt="PNG32"
+    "${MAGICK[@]}" "$src" -auto-orient -filter Point -resize "${MAX_EDGE}x${MAX_EDGE}>" "${png_fmt}:$ref_png"
+    cwebp -quiet -lossless -z 9 -o "$out_webp" -- "$ref_png"
+    mode="palette-lossless (${colors}c)"
+    psnr="inf"
+  else
+    # Photographs and gradients: downscale in linear light with Lanczos3,
+    # encode with gamma-aware sharp YUV, and step quality from 85 to 90 until
+    # PSNR reaches at least 42 dB against the 5K linear-light reference.
+    png_fmt="PNG24"
+    (( has_alpha == 1 )) && png_fmt="PNG32"
+    "${MAGICK[@]}" "$src" -auto-orient -colorspace RGB -filter Lanczos -resize "${MAX_EDGE}x${MAX_EDGE}>" -colorspace sRGB "${png_fmt}:$ref_png"
+    chosen_q=85
+    chosen_psnr=""
+    for q in 85 88 90; do
+      cwebp -quiet -q "$q" -m 6 -sharp_yuv -o "$out_webp" -- "$ref_png"
+      p=$(psnr_of "$ref_png" "$out_webp")
+      chosen_q=$q
+      chosen_psnr=$p
+      if awk -v p="$p" -v min="$MIN_PSNR" 'BEGIN{exit !(p == "inf" || p+0 >= min)}'; then
+        break
+      fi
+    done
+    mode="q${chosen_q}-m6-sharp_yuv"
+    psnr="$chosen_psnr"
+  fi
+
+  if (( has_rgb_icc == 1 )); then
+    webpmux -set icc "$icc_file" "$out_webp" -o "$out_icc_webp" >/dev/null
+    mv "$out_icc_webp" "$out_webp"
+  fi
+
+  read -r nw nh <<<"$("${IDENTIFY[@]}" -ping -format "%w %h" -- "$out_webp")"
+  new_sz=$(file_size "$out_webp")
+  if [[ $dst == "$src" ]]; then
+    mv -- "$out_webp" "$dst"
+  else
+    # Atomic no-clobber creation so concurrent runs cannot overwrite each other,
+    # and keep the non-WebP source intact so tracked filenames/symlinks never break.
+    if (set -o noclobber; cat -- "$out_webp" > "$dst") 2>/dev/null; then
+      rm -f -- "$out_webp"
+    else
+      echo "$dst already exists; refusing to overwrite from $src" >&2
+      exit 1
+    fi
+  fi
+  printf "done %-40s %5dx%-4d (%6.1fK) -> %4dx%-4d (%6.1fK)  %-22s PSNR=%s\n" \
+    "$dst" "$w" "$h" "$(awk -v s="$orig_sz" 'BEGIN{print s/1024}')" \
+    "$nw" "$nh" "$(awk -v s="$new_sz" 'BEGIN{print s/1024}')" "$mode" "$psnr"
+done

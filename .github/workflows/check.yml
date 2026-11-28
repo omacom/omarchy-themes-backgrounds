@@ -1,0 +1,16 @@
+name: Check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  backgrounds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install image tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends imagemagick webp
+      - name: Validate backgrounds
+        run: .github/scripts/check
